@@ -1,0 +1,35 @@
+listen_address: ":9300"
+metrics_interval: 30
+logging:
+  level: "debug"
+  format: "json"
+
+block_tracking:
+  enabled: true
+  interval: 5
+  max_consecutive_missed: 100
+
+prometheus:
+  server: "http://219.255.103.189:27660"
+
+chains:
+  - chain_id: "haqq_11235-1"
+    name: "HAQQ Network"
+    rpc: "http://219.255.103.189:27657"
+    api: "http://219.255.103.189:27317"
+    websocket: "ws://219.255.103.189:27657/websocket"
+    
+    auto_detect: true
+    
+    token_display: "ISLM"
+    token_decimals: 18
+    
+    validators:
+      - "haqqvaloper1tdzdn4zdnntdjkxtx8lrp9m8rpdu9yz356j8a5"
+    
+    wallets:
+      - address: "haqq1tdzdn4zdnntdjkxtx8lrp9m8rpdu9yz3cc7fe4"
+        name: "Main Wallet"
+    
+    peers:
+      - "http://219.255.103.189:27657"
