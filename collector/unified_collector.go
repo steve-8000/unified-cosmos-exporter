@@ -27,6 +27,10 @@ type validatorState struct {
 	isJailed          bool
 	lastBlockTime     time.Time
 	consensusAddress  string
+	signedBlocksWindow int
+	windowStartHeight   int
+	windowSignedBlocks  int
+	windowMissedBlocks  int
 }
 
 type UnifiedCollector struct {
@@ -58,7 +62,6 @@ type UnifiedCollector struct {
 	validatorCommissionRate *prometheus.Desc
 	validatorCommission  *prometheus.Desc
 	validatorRewards     *prometheus.Desc
-	validatorMissedBlocks *prometheus.Desc
 	validatorRank        *prometheus.Desc
 	validatorActive      *prometheus.Desc
 	validatorStatus      *prometheus.Desc
@@ -126,7 +129,6 @@ func NewUnifiedCollector(client *rpc.Client, cfg *config.Chain, prometheusURL st
 		validatorCommissionRate: prometheus.NewDesc("cosmos_validators_commission", "Validator commission rate", []string{"chain_id", "address", "moniker"}, nil),
 		validatorCommission:  prometheus.NewDesc("cosmos_validator_commission", "Validator commission", []string{"chain_id", "address", "moniker", "denom"}, nil),
 		validatorRewards:     prometheus.NewDesc("cosmos_validator_rewards", "Validator outstanding rewards", []string{"chain_id", "address", "moniker", "denom"}, nil),
-		validatorMissedBlocks: prometheus.NewDesc("cosmos_validators_missed_blocks", "Validator missed blocks", []string{"chain_id", "address", "moniker"}, nil),
 		validatorRank:        prometheus.NewDesc("cosmos_validators_rank", "Validator rank", []string{"chain_id", "address", "moniker"}, nil),
 		validatorActive:      prometheus.NewDesc("cosmos_validator_active", "Validator active status", []string{"chain_id", "address", "moniker"}, nil),
 		validatorStatus:      prometheus.NewDesc("cosmos_validator_status", "Validator status code", []string{"chain_id", "address", "moniker"}, nil),
@@ -137,9 +139,9 @@ func NewUnifiedCollector(client *rpc.Client, cfg *config.Chain, prometheusURL st
 		tdUp:                prometheus.NewDesc("cosmos_node_up", "Whether the RPC endpoint is reachable.", []string{"chain_id", "rpc_url"}, nil),
 		tdNodeHeight:        prometheus.NewDesc("cosmos_node_height", "The current height of the monitored node.", []string{"chain_id"}, nil),
 		tdBlocksBehind:      prometheus.NewDesc("cosmos_blocks_behind", "Number of blocks the monitored node is behind the peers.", []string{"chain_id"}, nil),
-		tdSignedBlocks:      prometheus.NewDesc("cosmos_signed_blocks", "Signed blocks since start", []string{"chain_id", "validator_address", "moniker"}, nil),
+		tdSignedBlocks:      prometheus.NewDesc("cosmos_signed_blocks", "Signed blocks in current window", []string{"chain_id", "validator_address", "moniker"}, nil),
 		tdProposedBlocks:    prometheus.NewDesc("cosmos_proposed_blocks", "Proposed blocks since start", []string{"chain_id", "validator_address", "moniker"}, nil),
-		tdMissedBlocks:      prometheus.NewDesc("cosmos_missed_blocks", "Missed blocks since start", []string{"chain_id", "validator_address", "moniker"}, nil),
+		tdMissedBlocks:      prometheus.NewDesc("cosmos_validators_missed_blocks", "Missed blocks in current window", []string{"chain_id", "validator_address", "moniker"}, nil),
 		tdConsecutiveMissed: prometheus.NewDesc("cosmos_consecutive_missed_blocks", "Number of consecutive missed blocks.", []string{"chain_id", "validator_address", "moniker"}, nil),
 		tdValidatorActive:   prometheus.NewDesc("cosmos_validator_active_set", "Indicates if the validator is in the active set.", []string{"chain_id", "validator_address", "moniker"}, nil),
 		tdValidatorJailed:   prometheus.NewDesc("cosmos_validator_jailed_status", "Indicates if the validator is jailed.", []string{"chain_id", "validator_address", "moniker"}, nil),
@@ -179,7 +181,6 @@ func (c *UnifiedCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.validatorCommissionRate
 	ch <- c.validatorCommission
 	ch <- c.validatorRewards
-	ch <- c.validatorMissedBlocks
 	ch <- c.validatorRank
 	ch <- c.validatorActive
 	ch <- c.validatorStatus
@@ -291,9 +292,9 @@ func (c *UnifiedCollector) collectTenderdutyMetrics(ch chan<- prometheus.Metric)
 		c.mu.RLock()
 		state, exists := c.validatorStates[validatorAddr]
 		if exists && state != nil {
-			signedBlocks = state.signedBlocks
+			signedBlocks = state.windowSignedBlocks  // 윈도우 기반 서명 블록
 			proposedBlocks = state.proposedBlocks
-			missedBlocks = state.missedBlocks
+			missedBlocks = state.windowMissedBlocks  // 윈도우 기반 놓친 블록
 			consecutiveMissed = state.consecutiveMissed
 		}
 		c.mu.RUnlock()
@@ -572,12 +573,6 @@ func (c *UnifiedCollector) collectValidatorsMetrics(ch chan<- prometheus.Metric)
 			}
 		}
 
-		// Missed blocks
-		// validator의 missed blocks와 signed blocks는 analyzeBlock에서 이미 계산됨
-		// 여기서는 validatorStates의 값을 사용하여 메트릭을 노출
-		if state, exists := c.validatorStates[validator.OperatorAddress]; exists {
-			ch <- prometheus.MustNewConstMetric(c.validatorMissedBlocks, prometheus.GaugeValue, float64(state.missedBlocks), c.cfg.ChainID, validator.OperatorAddress, validator.Description.Moniker)
-		}
 
 		// Rank (tokens 기준으로 계산)
 		rank := 1
@@ -663,28 +658,20 @@ func (c *UnifiedCollector) collectValidatorsMetrics(ch chan<- prometheus.Metric)
 func (c *UnifiedCollector) TrackBlocks(ctx context.Context) error {
 	c.initializeValidatorStates()
 
-	// 초기 블록 높이를 외부 Prometheus 서버에서 가져오거나 현재 노드 높이로 설정
-	var initialHeight float64 = 18151260
-	
-	if c.prometheusClient != nil {
-		if promHeight, err := c.prometheusClient.GetNodeHeight(); err == nil {
-			initialHeight = promHeight
-			c.logger.Info("Initial block height set from external Prometheus", "height", initialHeight)
+	// 현재 노드의 블록 높이를 가져와서 초기 높이로 설정
+	var initialHeight float64
+	status, err := c.client.GetStatus()
+	if err == nil && status != nil && status.Result.SyncInfo.LatestBlockHeight != "" {
+		if height, err := strconv.ParseFloat(status.Result.SyncInfo.LatestBlockHeight, 64); err == nil {
+			initialHeight = height
+			c.logger.Info("Starting block tracking from current height", "height", initialHeight)
 		} else {
-			c.logger.Warn("Failed to get height from external Prometheus, using local status", "error", err)
+			c.logger.Error("Failed to parse initial block height", "raw_height", status.Result.SyncInfo.LatestBlockHeight, "error", err)
+			return err
 		}
-	}
-	
-	if initialHeight == 18151260 {
-		status, err := c.client.GetStatus()
-		if err == nil && status != nil && status.Result.SyncInfo.LatestBlockHeight != "" {
-			if height, err := strconv.ParseFloat(status.Result.SyncInfo.LatestBlockHeight, 64); err == nil {
-				initialHeight = height
-				c.logger.Info("Initial block height set from local status", "height", initialHeight)
-			} else {
-				c.logger.Error("Failed to parse initial block height", "raw_height", status.Result.SyncInfo.LatestBlockHeight, "error", err)
-			}
-		}
+	} else {
+		c.logger.Error("Failed to get initial block height from status", "error", err)
+		return err
 	}
 	
 	c.mu.Lock()
@@ -789,9 +776,25 @@ func (c *UnifiedCollector) TrackBlocks(ctx context.Context) error {
 }
 
 func (c *UnifiedCollector) initializeValidatorStates() {
+	c.logger.Info("Initializing validator states")
+
+	// Slashing 파라미터를 가져와서 signedBlocksWindow 설정
+	slashingParams, err := c.client.GetSlashingParams()
+	if err != nil {
+		c.logger.Error("Failed to get slashing params for window size", "error", err)
+		// 기본값 사용
+		c.downtimeJailDuration = 600 // 10분
+	} else {
+		if downtimeJailDuration, err := time.ParseDuration(slashingParams.Params.DowntimeJailDuration); err == nil {
+			c.downtimeJailDuration = downtimeJailDuration.Seconds()
+		} else {
+			c.downtimeJailDuration = 600 // 기본값
+		}
+	}
+
 	validators, err := c.client.GetValidators()
 	if err != nil {
-		c.logger.Error("Failed to initialize validator states", "error", err)
+		c.logger.Error("Failed to get validators", "error", err)
 		return
 	}
 
@@ -799,6 +802,14 @@ func (c *UnifiedCollector) initializeValidatorStates() {
 	defer c.mu.Unlock()
 
 	for _, validatorAddr := range c.cfg.Validators {
+		// signedBlocksWindow 값을 가져와서 설정
+		var signedBlocksWindow int = 100 // 기본값
+		if slashingParams != nil {
+			if window, err := strconv.Atoi(slashingParams.Params.SignedBlocksWindow); err == nil {
+				signedBlocksWindow = window
+			}
+		}
+
 		state := &validatorState{
 			moniker:           "unknown",
 			signedBlocks:      0,
@@ -808,6 +819,11 @@ func (c *UnifiedCollector) initializeValidatorStates() {
 			inActiveSet:       false,
 			isJailed:          false,
 			lastBlockTime:     time.Now(),
+			consensusAddress:  "",
+			signedBlocksWindow: signedBlocksWindow,
+			windowStartHeight:  0,
+			windowSignedBlocks: 0,
+			windowMissedBlocks: 0,
 		}
 
 		for _, v := range validators.Validators {
@@ -841,7 +857,8 @@ func (c *UnifiedCollector) initializeValidatorStates() {
 			"validator", validatorAddr, 
 			"moniker", state.moniker,
 			"active", state.inActiveSet,
-			"jailed", state.isJailed)
+			"jailed", state.isJailed,
+			"signed_blocks_window", signedBlocksWindow)
 	}
 }
 
@@ -927,18 +944,46 @@ func (c *UnifiedCollector) analyzeBlock(height int) {
 			continue
 		}
 
+		// 윈도우 시작 높이 설정 (첫 번째 블록이거나 윈도우가 변경된 경우)
+		if state.windowStartHeight == 0 {
+			state.windowStartHeight = height
+			state.windowSignedBlocks = 0
+			state.windowMissedBlocks = 0
+			c.logger.Info("Starting new window for validator", 
+				"validator", validatorAddr, 
+				"window_start_height", state.windowStartHeight,
+				"window_size", state.signedBlocksWindow)
+		}
+
+		// 윈도우가 끝났는지 확인
+		blocksInWindow := height - state.windowStartHeight + 1
+		if blocksInWindow > state.signedBlocksWindow {
+			// 윈도우가 끝났으므로 새로운 윈도우 시작
+			state.windowStartHeight = height - state.signedBlocksWindow + 1
+			state.windowSignedBlocks = 0
+			state.windowMissedBlocks = 0
+			c.logger.Info("Starting new window for validator", 
+				"validator", validatorAddr, 
+				"window_start_height", state.windowStartHeight,
+				"window_size", state.signedBlocksWindow)
+		}
+
 		c.logger.Info("Checking validator signature", "valoper", validatorAddr, "consensus_address", state.consensusAddress)
 
 		if signedValidators[state.consensusAddress] {
 			state.signedBlocks++
+			state.windowSignedBlocks++
 			state.consecutiveMissed = 0
 			c.logger.Info("Validator signed block", 
 				"validator", validatorAddr,
 				"moniker", state.moniker,
 				"height", height,
-				"signed_blocks", state.signedBlocks)
+				"signed_blocks", state.signedBlocks,
+				"window_signed", state.windowSignedBlocks,
+				"window_missed", state.windowMissedBlocks)
 		} else {
 			state.missedBlocks++
+			state.windowMissedBlocks++
 			state.consecutiveMissed++
 			
 			// 외부 Prometheus 서버의 평균 블록 시간을 사용하여 consecutive_missed 제한
@@ -987,6 +1032,7 @@ func (c *UnifiedCollector) analyzeBlock(height int) {
 				"moniker", state.moniker,
 				"height", height,
 				"missed_blocks", state.missedBlocks,
+				"window_missed", state.windowMissedBlocks,
 				"consecutive_missed", state.consecutiveMissed)
 		}
 
